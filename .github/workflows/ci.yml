@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run test:cov
+      - run: npm run build
+
+  nest11:
+    name: NestJS 11 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm install --no-save @nestjs/common@^11 @nestjs/core@^11 @nestjs/platform-express@^11 @nestjs/testing@^11
+      - run: npx vitest run test/nest
+
+  package:
+    name: Package smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm pack
+      - name: Import the packed tarball from a clean project
+        run: |
+          mkdir /tmp/consumer && cd /tmp/consumer
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE"/nestjs-latam-payments-*.tgz @nestjs/common @nestjs/core reflect-metadata rxjs
+          node --input-type=module -e "import 'reflect-metadata'; const m = await import('nestjs-latam-payments'); if (!m.PaymentsModule || !m.WompiProvider) process.exit(1); console.log(Object.keys(m).length, 'exports')"
+          node -e "require('reflect-metadata'); const m = require('nestjs-latam-payments'); if (!m.PaymentsModule) process.exit(1); console.log('require(esm) ok')"

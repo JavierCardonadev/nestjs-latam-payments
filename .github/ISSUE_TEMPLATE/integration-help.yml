@@ -1,0 +1,33 @@
+name: Integration help / consulting
+description: Need a hand integrating payments in your product? Tell me about the project.
+labels: [integration-help]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        I'm Javier Cardona, the maintainer. Besides this library, I build and fix payment integrations for companies in Latin America — checkout, webhooks, reconciliation, subscriptions and multi-country setups.
+        Prefer to talk privately? Reach out through **[javiercardona.dev](https://javiercardona.dev)**. Do not share secrets or customer data here.
+  - type: textarea
+    id: project
+    attributes:
+      label: Your project
+      description: What you sell, stack, current payment setup.
+    validations:
+      required: true
+  - type: input
+    id: providers
+    attributes:
+      label: Providers and countries
+      placeholder: Wompi + Stripe, Colombia and Mexico
+  - type: textarea
+    id: goal
+    attributes:
+      label: What do you need?
+      description: New integration, migration, bug in production, review, subscriptions…
+    validations:
+      required: true
+  - type: dropdown
+    id: timeline
+    attributes:
+      label: Timeline
+      options: [ASAP, This month, Next quarter, Exploring]

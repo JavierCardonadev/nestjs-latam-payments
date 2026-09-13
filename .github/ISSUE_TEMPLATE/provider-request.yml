@@ -1,0 +1,35 @@
+name: Provider request
+description: Ask for (or propose to build) a new payment gateway
+labels: [provider]
+body:
+  - type: input
+    id: provider
+    attributes:
+      label: Provider
+      placeholder: Kushki, Conekta, dLocal…
+    validations:
+      required: true
+  - type: input
+    id: countries
+    attributes:
+      label: Countries you need
+      placeholder: Ecuador, Peru
+  - type: input
+    id: docs
+    attributes:
+      label: API documentation
+      placeholder: https://…
+  - type: checkboxes
+    id: features
+    attributes:
+      label: Features needed
+      options:
+        - label: Hosted checkout / redirect
+        - label: Webhooks
+        - label: Refunds
+        - label: Local methods (PSE, OXXO, Pix, Yape…)
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you contribute it?
+      options: [Yes, I'll open a PR, I can help test in sandbox, No]

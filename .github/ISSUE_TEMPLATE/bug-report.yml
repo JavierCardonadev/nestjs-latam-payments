@@ -1,0 +1,40 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security issue?** Don't file it here — use [private reporting](https://github.com/JavierCardonadev/nestjs-latam-payments/security/advisories/new).
+        Never paste real API keys, secrets or customer data.
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options: [Wompi, Mercado Pago, PayU, Stripe, PayPal, Module / core, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Expected vs actual behavior. Include the error message and `error.code` / `error.httpStatus` for `ProviderError`.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal code or request. Redact secrets.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: nestjs-latam-payments 0.1.0, @nestjs/core 12.0.1, Node 22.20
+    validations:
+      required: true
+  - type: dropdown
+    id: env
+    attributes:
+      label: Environment
+      options: [Sandbox, Production]
