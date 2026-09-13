@@ -4,6 +4,8 @@ Configuration, status mapping and quirks of each built-in adapter. Every adapter
 
 ## Wompi (Colombia)
 
+> No hosted recurring billing: subscription methods throw `UnsupportedOperationError`.
+
 ```ts
 wompi: {
   publicKey: 'pub_test_…',          // pub_prod_… in production
@@ -53,7 +55,16 @@ mercadopago: {
 | cancelled                         | canceled                                                            |
 | refunded, charged_back            | refunded                                                            |
 
+### Subscriptions (Mercado Pago)
+
+- **Plans**: `POST /preapproval_plan`. Weeks and years are sent as days (×7) and months (×12). Trials use `free_trial` in days; `totalCycles` → `repetitions`. Pass `providerOptions: { back_url }` if your account requires it.
+- **Subscriptions**: "pending payment" preapprovals (`status: 'pending'`) — the customer authorizes at `init_point` with any payment method. With a plan id, the plan's `auto_recurring` is copied into the preapproval so it keeps your `external_reference` (subscriptions linked to `preapproval_plan_id` require a card token). `customer.email` and `successUrl` are required.
+- **Status**: `pending` → pending, `authorized` → active, `paused` → paused, `cancelled` → canceled. Cancellation is immediate.
+- **Webhooks**: `subscription_preapproval` hydrates `/preapproval/{id}`; `subscription_authorized_payment` hydrates `/authorized_payments/{id}` and maps its `payment.status` (`approved` → `subscription.payment_succeeded`, `rejected` → `subscription.payment_failed`).
+
 ## PayU LATAM
+
+> Subscription methods are not implemented: PayU's Recurring Payments API requires handling card data (PCI scope).
 
 ```ts
 payu: {
@@ -106,6 +117,22 @@ stripe: {
 | payment_intent.amount_capturable_updated                                              | payment.authorized                            |
 | charge.refunded                                                                       | payment.refunded / payment.partially_refunded |
 
+### Subscriptions (Stripe)
+
+- **Plans**: a recurring Price created with `product_data`; the plan id is the price id. The default `trialDays` is stored in the price metadata and applied as `subscription_data.trial_period_days`. `totalCycles` is not supported (use Subscription Schedules).
+- **Subscriptions**: Checkout Session in `subscription` mode. `reference` → `client_reference_id` and subscription metadata. `getSubscription` accepts `sub_…` or the `cs_…` session id.
+- **Cancel**: now (`DELETE`) or `atPeriodEnd` (`cancel_at_period_end`). Pause/resume use `pause_collection` (`void`).
+- **Status**: `incomplete` → pending, `trialing`, `active` (paused when `pause_collection` is set), `past_due`/`unpaid` → past_due, `canceled`, `incomplete_expired` → expired. The billing period is read from the subscription or, on API versions from 2025-03, from its item.
+
+| Stripe event                                                | Normalized                                                      |
+| ----------------------------------------------------------- | --------------------------------------------------------------- |
+| customer.subscription.created / resumed                     | subscription.activated (or pending when incomplete)             |
+| customer.subscription.updated with a status or pause change | subscription.activated / past_due / paused / canceled / expired |
+| customer.subscription.updated (other changes)               | subscription.updated                                            |
+| customer.subscription.deleted                               | subscription.canceled                                           |
+| invoice.paid / invoice.payment_failed of a subscription     | subscription.payment_succeeded / subscription.payment_failed    |
+| checkout.session.* in subscription mode                     | unknown (with `subscriptionId`)                                 |
+
 ## PayPal
 
 ```ts
@@ -132,3 +159,20 @@ paypal: {
 | PAYMENT.CAPTURE.PENDING                             | payment.pending                                                   |
 | PAYMENT.CAPTURE.DENIED / DECLINED                   | payment.failed                                                    |
 | PAYMENT.CAPTURE.REFUNDED / REVERSED                 | payment.refunded (use `getPayment` for the exact refunded amount) |
+
+### Subscriptions (PayPal)
+
+- **Plans**: creates a catalog product (or reuses `providerOptions.productId`) and a billing plan with an optional free `TRIAL` cycle (≤ 365 days) and a `REGULAR` cycle (`total_cycles` 0 = until canceled).
+- **Subscriptions**: require a plan id. `reference` → `custom_id` (≤ 127 chars); `url` is the `approve` link. No search API, so `findSubscriptionByReference` is unsupported.
+- **Cancel / pause / resume**: `cancel`, `suspend`, `activate` (immediate); the subscription is read back afterwards.
+- **Status**: `APPROVAL_PENDING`/`APPROVED` → pending, `ACTIVE` → active (trialing while a trial cycle remains), `SUSPENDED` → paused, `CANCELLED` → canceled, `EXPIRED` → expired. `amount` is the last payment.
+
+| PayPal event                                             | Normalized                                   |
+| -------------------------------------------------------- | -------------------------------------------- |
+| BILLING.SUBSCRIPTION.CREATED                             | subscription.pending                         |
+| BILLING.SUBSCRIPTION.ACTIVATED / RE-ACTIVATED            | subscription.activated                       |
+| BILLING.SUBSCRIPTION.UPDATED                             | subscription.updated                         |
+| BILLING.SUBSCRIPTION.SUSPENDED                           | subscription.paused                          |
+| BILLING.SUBSCRIPTION.CANCELLED / EXPIRED                 | subscription.canceled / subscription.expired |
+| BILLING.SUBSCRIPTION.PAYMENT.FAILED, PAYMENT.SALE.DENIED | subscription.payment_failed                  |
+| PAYMENT.SALE.COMPLETED with `billing_agreement_id`       | subscription.payment_succeeded               |

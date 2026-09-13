@@ -258,3 +258,314 @@ describe('PayPalProvider', () => {
     });
   });
 });
+
+const subscription = {
+  id: 'I-BW452GLLEP1G',
+  status: 'ACTIVE',
+  plan_id: 'P-5ML4271244454362WXNWU5NQ',
+  custom_id: 'TENANT-7',
+  create_time: '2026-09-01T10:00:00Z',
+  subscriber: { email_address: 'ana@test.com' },
+  billing_info: {
+    next_billing_time: '2026-10-01T10:00:00Z',
+    last_payment: { amount: { currency_code: 'USD', value: '19.99' }, time: '2026-09-01T10:00:00Z' },
+    cycle_executions: [{ tenure_type: 'REGULAR', sequence: 1, cycles_completed: 1, cycles_remaining: 0 }],
+  },
+  links: [{ rel: 'approve', href: 'https://www.sandbox.paypal.com/webapps/billing/subscriptions?ba_token=BA-1' }],
+};
+
+describe('PayPalProvider subscriptions', () => {
+  it('creates a product and a plan with a trial', async () => {
+    const { paypal, calls } = provider([
+      { method: 'POST', url: `${API}/v1/catalogs/products`, body: { id: 'PROD-1' } },
+      {
+        method: 'POST',
+        url: `${API}/v1/billing/plans`,
+        body: {
+          id: 'P-1',
+          name: 'Pro',
+          status: 'ACTIVE',
+          billing_cycles: [
+            {
+              tenure_type: 'TRIAL',
+              sequence: 1,
+              total_cycles: 1,
+              frequency: { interval_unit: 'DAY', interval_count: 14 },
+            },
+            {
+              tenure_type: 'REGULAR',
+              sequence: 2,
+              total_cycles: 0,
+              frequency: { interval_unit: 'MONTH', interval_count: 1 },
+              pricing_scheme: { fixed_price: { value: '19.99', currency_code: 'USD' } },
+            },
+          ],
+        },
+      },
+    ]);
+    const plan = await paypal.createPlan({
+      name: 'Pro',
+      description: 'Pro plan',
+      amount: 1999,
+      currency: 'USD',
+      interval: 'month',
+      trialDays: 14,
+      idempotencyKey: 'plan-pro',
+    });
+    expect(plan).toMatchObject({
+      id: 'P-1',
+      amount: 1999,
+      currency: 'USD',
+      interval: 'month',
+      intervalCount: 1,
+      trialDays: 14,
+      totalCycles: undefined,
+      active: true,
+    });
+    expect(calls[1].json()).toEqual({ name: 'Pro', description: 'Pro plan', type: 'SERVICE' });
+    expect(calls[1].headers['PayPal-Request-Id']).toBe('plan-pro-product');
+    expect(calls[2].json()).toEqual({
+      product_id: 'PROD-1',
+      name: 'Pro',
+      description: 'Pro plan',
+      status: 'ACTIVE',
+      billing_cycles: [
+        { frequency: { interval_unit: 'DAY', interval_count: 14 }, tenure_type: 'TRIAL', sequence: 1, total_cycles: 1 },
+        {
+          frequency: { interval_unit: 'MONTH', interval_count: 1 },
+          tenure_type: 'REGULAR',
+          sequence: 2,
+          total_cycles: 0,
+          pricing_scheme: { fixed_price: { value: '19.99', currency_code: 'USD' } },
+        },
+      ],
+      payment_preferences: { auto_bill_outstanding: true, payment_failure_threshold: 3 },
+    });
+  });
+
+  it('reuses a product and limits cycles', async () => {
+    const { paypal, calls } = provider([
+      { method: 'POST', url: `${API}/v1/billing/plans`, body: { id: 'P-2', status: 'CREATED', billing_cycles: [] } },
+    ]);
+    const plan = await paypal.createPlan({
+      name: 'Anual',
+      amount: 120000,
+      currency: 'MXN',
+      interval: 'year',
+      totalCycles: 2,
+      providerOptions: { productId: 'PROD-9', quantity_supported: true },
+    });
+    expect(plan).toMatchObject({ id: 'P-2', active: false, amount: undefined, interval: undefined });
+    const body = calls[1].json();
+    expect(body).toMatchObject({ product_id: 'PROD-9', quantity_supported: true });
+    expect(body.productId).toBeUndefined();
+    expect(body.billing_cycles).toEqual([
+      {
+        frequency: { interval_unit: 'YEAR', interval_count: 1 },
+        tenure_type: 'REGULAR',
+        sequence: 1,
+        total_cycles: 2,
+        pricing_scheme: { fixed_price: { value: '1200.00', currency_code: 'MXN' } },
+      },
+    ]);
+
+    await expect(paypal.createPlan({ name: 'x', amount: 100, currency: 'COP', interval: 'month' })).rejects.toThrow(
+      'paypal does not support COP',
+    );
+    await expect(
+      paypal.createPlan({ name: 'x', amount: 100, currency: 'USD', interval: 'month', trialDays: 400 }),
+    ).rejects.toThrow('trialDays must be at most 365');
+  });
+
+  it('reads plans', async () => {
+    const { paypal } = provider([
+      {
+        method: 'GET',
+        url: `${API}/v1/billing/plans/P-3`,
+        body: {
+          id: 'P-3',
+          status: 'ACTIVE',
+          billing_cycles: [
+            { tenure_type: 'TRIAL', total_cycles: 2, frequency: { interval_unit: 'DAY', interval_count: 7 } },
+            {
+              tenure_type: 'REGULAR',
+              total_cycles: 12,
+              frequency: { interval_unit: 'WEEK', interval_count: 2 },
+              pricing_scheme: { fixed_price: { value: '5', currency_code: 'JPY' } },
+            },
+          ],
+        },
+      },
+    ]);
+    expect(await paypal.getPlan('P-3')).toMatchObject({
+      trialDays: 14,
+      interval: 'week',
+      intervalCount: 2,
+      totalCycles: 12,
+      amount: 5,
+      currency: 'JPY',
+    });
+  });
+
+  it('creates subscriptions from a plan id', async () => {
+    const { paypal, calls } = provider([
+      { method: 'POST', url: `${API}/v1/billing/subscriptions`, body: { ...subscription, status: 'APPROVAL_PENDING' } },
+    ]);
+    const session = await paypal.createSubscription({
+      reference: 'TENANT-7',
+      plan: 'P-5ML4271244454362WXNWU5NQ',
+      customer: { email: 'ana@test.com', name: 'Ana María López' },
+      successUrl: 'https://app.test/ok',
+      cancelUrl: 'https://app.test/ko',
+      idempotencyKey: 'sub-7',
+    });
+    expect(session).toMatchObject({ id: subscription.id, reference: 'TENANT-7', url: subscription.links[0].href });
+    expect(calls[1].json()).toEqual({
+      plan_id: 'P-5ML4271244454362WXNWU5NQ',
+      custom_id: 'TENANT-7',
+      subscriber: { email_address: 'ana@test.com', name: { given_name: 'Ana', surname: 'María López' } },
+      application_context: {
+        user_action: 'SUBSCRIBE_NOW',
+        shipping_preference: 'NO_SHIPPING',
+        return_url: 'https://app.test/ok',
+        cancel_url: 'https://app.test/ko',
+      },
+    });
+    expect(calls[1].headers['PayPal-Request-Id']).toBe('sub-7');
+
+    await expect(
+      paypal.createSubscription({ reference: 'T', plan: { name: 'x', amount: 1, currency: 'USD', interval: 'month' } }),
+    ).rejects.toThrow('create one with createPlan()');
+    await expect(paypal.createSubscription({ reference: 'x'.repeat(128), plan: 'P' })).rejects.toBeInstanceOf(
+      PaymentValidationError,
+    );
+  });
+
+  it('maps subscriptions, including trials', async () => {
+    const trial = {
+      ...subscription,
+      billing_info: {
+        next_billing_time: '2026-09-15T10:00:00Z',
+        cycle_executions: [{ tenure_type: 'TRIAL', cycles_completed: 0, cycles_remaining: 1 }],
+      },
+    };
+    const { paypal } = provider([
+      { method: 'GET', url: `${API}/v1/billing/subscriptions/I-BW452GLLEP1G`, body: subscription },
+      { method: 'GET', url: `${API}/v1/billing/subscriptions/I-TRIAL`, body: trial },
+    ]);
+    expect(await paypal.getSubscription('I-BW452GLLEP1G')).toEqual({
+      provider: 'paypal',
+      id: 'I-BW452GLLEP1G',
+      reference: 'TENANT-7',
+      status: 'active',
+      planId: 'P-5ML4271244454362WXNWU5NQ',
+      amount: 1999,
+      currency: 'USD',
+      currentPeriodEnd: new Date('2026-10-01T10:00:00Z'),
+      nextBillingAt: new Date('2026-10-01T10:00:00Z'),
+      canceledAt: undefined,
+      customerEmail: 'ana@test.com',
+      createdAt: new Date('2026-09-01T10:00:00Z'),
+      raw: subscription,
+    });
+    expect(await paypal.getSubscription('I-TRIAL')).toMatchObject({ status: 'trialing', amount: undefined });
+    await expect(paypal.findSubscriptionByReference()).rejects.toBeInstanceOf(UnsupportedOperationError);
+  });
+
+  it('cancels, suspends and activates, reading the subscription back', async () => {
+    const cancelled = { ...subscription, status: 'CANCELLED', status_update_time: '2026-09-20T10:00:00Z' };
+    const { paypal, calls } = provider([
+      { method: 'POST', url: /\/v1\/billing\/subscriptions\/I-1\/(cancel|suspend|activate)$/, status: 204 },
+      { method: 'GET', url: `${API}/v1/billing/subscriptions/I-1`, body: cancelled },
+    ]);
+    expect(await paypal.cancelSubscription({ subscriptionId: 'I-1', reason: 'Customer request' })).toMatchObject({
+      status: 'canceled',
+      canceledAt: new Date('2026-09-20T10:00:00Z'),
+      nextBillingAt: undefined,
+    });
+    expect(calls[1].url.pathname).toBe('/v1/billing/subscriptions/I-1/cancel');
+    expect(calls[1].json()).toEqual({ reason: 'Customer request' });
+
+    await paypal.pauseSubscription('I-1');
+    expect(calls[3].url.pathname).toBe('/v1/billing/subscriptions/I-1/suspend');
+    await paypal.resumeSubscription('I-1');
+    expect(calls[5].url.pathname).toBe('/v1/billing/subscriptions/I-1/activate');
+    expect(calls[5].json()).toEqual({ reason: 'Resumed by the merchant' });
+
+    await expect(paypal.cancelSubscription({ subscriptionId: 'I-1', atPeriodEnd: true })).rejects.toBeInstanceOf(
+      UnsupportedOperationError,
+    );
+  });
+
+  it('maps BILLING.SUBSCRIPTION and PAYMENT.SALE webhooks', async () => {
+    const { paypal } = provider();
+    const activated = await paypal.parseWebhook(
+      signed({
+        id: 'WH-1',
+        event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
+        create_time: '2026-09-01T10:00:00Z',
+        resource: subscription,
+      }),
+    );
+    expect(activated).toMatchObject({
+      type: 'subscription.activated',
+      subscriptionId: 'I-BW452GLLEP1G',
+      reference: 'TENANT-7',
+      amount: 1999,
+      currency: 'USD',
+      subscription: { status: 'active' },
+    });
+    expect(activated.status).toBeUndefined();
+
+    for (const [eventType, type] of [
+      ['BILLING.SUBSCRIPTION.CREATED', 'subscription.pending'],
+      ['BILLING.SUBSCRIPTION.SUSPENDED', 'subscription.paused'],
+      ['BILLING.SUBSCRIPTION.CANCELLED', 'subscription.canceled'],
+      ['BILLING.SUBSCRIPTION.EXPIRED', 'subscription.expired'],
+      ['BILLING.SUBSCRIPTION.PAYMENT.FAILED', 'subscription.payment_failed'],
+      ['BILLING.SUBSCRIPTION.SOMETHING', 'unknown'],
+    ]) {
+      const event = await paypal.parseWebhook(signed({ id: eventType, event_type: eventType, resource: subscription }));
+      expect(event.type).toBe(type);
+    }
+
+    const sale = await paypal.parseWebhook(
+      signed({
+        id: 'WH-2',
+        event_type: 'PAYMENT.SALE.COMPLETED',
+        resource: {
+          id: 'SALE-1',
+          billing_agreement_id: 'I-BW452GLLEP1G',
+          custom: 'TENANT-7',
+          amount: { total: '19.99', currency: 'USD' },
+        },
+      }),
+    );
+    expect(sale).toMatchObject({
+      type: 'subscription.payment_succeeded',
+      paymentId: 'SALE-1',
+      subscriptionId: 'I-BW452GLLEP1G',
+      reference: 'TENANT-7',
+      amount: 1999,
+      currency: 'USD',
+    });
+
+    const denied = await paypal.parseWebhook(
+      signed({
+        id: 'WH-3',
+        event_type: 'PAYMENT.SALE.DENIED',
+        resource: { id: 'S', billing_agreement_id: 'I-1', amount: {} },
+      }),
+    );
+    expect(denied).toMatchObject({ type: 'subscription.payment_failed', amount: undefined, reference: undefined });
+
+    const plainSale = await paypal.parseWebhook(
+      signed({
+        id: 'WH-4',
+        event_type: 'PAYMENT.SALE.COMPLETED',
+        resource: { id: 'S2', amount: { total: '1.00', currency: 'USD' } },
+      }),
+    );
+    expect(plainSale.type).toBe('unknown');
+  });
+});

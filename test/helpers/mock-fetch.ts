@@ -37,8 +37,12 @@ export function mockFetch(routes: MockRoute[]) {
         (typeof r.url === 'string' ? `${url.origin}${url.pathname}` === r.url : r.url.test(url.toString())),
     );
     if (!route) return new Response(JSON.stringify({ message: `no mock for ${method} ${url}` }), { status: 599 });
-    return new Response(route.body === undefined ? '' : JSON.stringify(route.body), {
-      status: route.status ?? 200,
+    const status = route.status ?? 200;
+    // Null-body statuses (204, 205, 304) can't carry a body, not even an empty string.
+    const responseBody =
+      route.body === undefined ? ([204, 205, 304].includes(status) ? null : '') : JSON.stringify(route.body);
+    return new Response(responseBody, {
+      status,
       headers: { 'content-type': 'application/json' },
     });
   };

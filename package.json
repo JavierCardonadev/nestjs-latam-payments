@@ -1,7 +1,7 @@
 {
   "name": "nestjs-latam-payments",
-  "version": "0.1.0",
-  "description": "One NestJS API for Stripe, PayPal, Mercado Pago, Wompi and PayU LATAM: checkout, payment status, refunds and verified webhooks with normalized events.",
+  "version": "0.2.0",
+  "description": "One NestJS API for Stripe, PayPal, Mercado Pago, Wompi and PayU LATAM: checkout, subscriptions, payment status, refunds and verified webhooks with normalized events.",
   "keywords": [
     "nestjs",
     "payments",
@@ -21,6 +21,8 @@
     "brasil",
     "webhooks",
     "checkout",
+    "subscriptions",
+    "recurring-payments",
     "typescript"
   ],
   "author": "Javier Cardona (https://javiercardona.dev)",

@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **One NestJS module for Wompi, Mercado Pago, PayU LATAM, Stripe and PayPal.**
-Create checkouts, verify webhooks, query and refund payments through a single normalized API — with signature verification checked against each provider's official test vectors.
+Create checkouts and subscriptions, verify webhooks, query and refund payments through a single normalized API — with signature verification checked against each provider's official test vectors.
 
 > 🇪🇸 [Leer en español](README.es.md)
 
@@ -20,7 +20,8 @@ async markPaid(event: PaymentEvent) {
 
 Selling in Latin America usually means integrating two or three gateways: a local one (Wompi in Colombia, Mercado Pago in Argentina/Mexico/Brazil, PayU across the region) plus Stripe or PayPal for international cards. Each one signs webhooks differently, uses different amount formats and status names, and has its own gotchas. This module hides all of that behind one interface.
 
-- **One model**: amounts in integer minor units + ISO 4217 currency, 9 normalized statuses, 8 lifecycle event types.
+- **One model**: amounts in integer minor units + ISO 4217 currency, normalized payment and subscription statuses and events.
+- **One-off payments and subscriptions**: plans, trials, pause/resume, cancel, and renewal charge events.
 - **Webhooks done right**: HMAC / RSA verification over the raw body, constant-time comparison, replay tolerance, status never trusted from unsigned payloads.
 - **Zero runtime dependencies**: native `fetch` and `node:crypto`. No provider SDKs.
 - **NestJS 11 and 12**, or use the adapters standalone in Express, Fastify, workers.
@@ -28,13 +29,13 @@ Selling in Latin America usually means integrating two or three gateways: a loca
 
 ## Providers
 
-| Provider         | Countries            | Checkout                      | Webhook verification                   | Get | Find by reference | Refund    | Partial refund |
-| ---------------- | -------------------- | ----------------------------- | -------------------------------------- | --- | ----------------- | --------- | -------------- |
-| **Wompi**        | 🇨🇴                   | Web Checkout (redirect)       | SHA-256 checksum + integrity signature | ✅  | —                 | ✅ (void) | —              |
-| **Mercado Pago** | 🇦🇷 🇧🇷 🇲🇽 🇨🇴 🇨🇱 🇵🇪 🇺🇾 | Checkout Pro                  | `x-signature` HMAC + API re-fetch      | ✅  | ✅                | ✅        | ✅             |
-| **PayU LATAM**   | 🇨🇴 🇲🇽 🇦🇷 🇧🇷 🇨🇱 🇵🇪 🇵🇦 | WebCheckout (POST form)       | MD5 / SHA-1 / SHA-256 `sign`           | ✅  | ✅                | ✅        | ✅             |
-| **Stripe**       | 🌎 (incl. 🇲🇽 🇧🇷)     | Checkout Sessions             | `Stripe-Signature` HMAC + tolerance    | ✅  | ✅                | ✅        | ✅             |
-| **PayPal**       | 🌎                   | Orders v2 (approve + capture) | RSA certificate self-verification      | ✅  | —                 | ✅        | ✅             |
+| Provider         | Countries            | Checkout                      | Webhook verification                   | Get | Find by reference | Refund    | Partial refund | Subscriptions |
+| ---------------- | -------------------- | ----------------------------- | -------------------------------------- | --- | ----------------- | --------- | -------------- | ------------- |
+| **Wompi**        | 🇨🇴                   | Web Checkout (redirect)       | SHA-256 checksum + integrity signature | ✅  | —                 | ✅ (void) | —              | —             |
+| **Mercado Pago** | 🇦🇷 🇧🇷 🇲🇽 🇨🇴 🇨🇱 🇵🇪 🇺🇾 | Checkout Pro                  | `x-signature` HMAC + API re-fetch      | ✅  | ✅                | ✅        | ✅             | ✅            |
+| **PayU LATAM**   | 🇨🇴 🇲🇽 🇦🇷 🇧🇷 🇨🇱 🇵🇪 🇵🇦 | WebCheckout (POST form)       | MD5 / SHA-1 / SHA-256 `sign`           | ✅  | ✅                | ✅        | ✅             | —             |
+| **Stripe**       | 🌎 (incl. 🇲🇽 🇧🇷)     | Checkout Sessions             | `Stripe-Signature` HMAC + tolerance    | ✅  | ✅                | ✅        | ✅             | ✅            |
+| **PayPal**       | 🌎                   | Orders v2 (approve + capture) | RSA certificate self-verification      | ✅  | —                 | ✅        | ✅             | ✅            |
 
 **Roadmap** (contributions welcome — see [issues](https://github.com/JavierCardonadev/nestjs-latam-payments/issues?q=label%3Aprovider)): dLocal, EBANX, Kushki, Conekta, Culqi, OpenPay, ePayco, Transbank Webpay, PagBank.
 
@@ -150,23 +151,93 @@ export class PaymentListener {
 
 Prefer RxJS? `paymentEvents.events$.subscribe(...)`.
 
+## Subscriptions
+
+Define a plan once, then send each customer to authorize it. Renewals, failures and cancellations arrive as `subscription.*` events on the same webhook endpoint.
+
+```ts
+// Once (or create it in the provider dashboard and use its id).
+const plan = await payments.createPlan(
+  { name: 'Pro', amount: 4_990_000, currency: 'COP', interval: 'month', trialDays: 14 },
+  'mercadopago',
+);
+
+// Per customer.
+const session = await payments.createSubscription(
+  {
+    reference: tenant.id, // comes back on every subscription event
+    plan: plan.id, // or an inline plan on Stripe and Mercado Pago
+    customer: { email: user.email },
+    successUrl: 'https://app.example.com/billing',
+  },
+  'mercadopago',
+);
+return { redirectUrl: session.url };
+```
+
+```ts
+@Injectable()
+export class BillingListener {
+  @OnPaymentEvent(['subscription.activated', 'subscription.payment_succeeded'])
+  async grantAccess(event: PaymentEvent) {
+    await this.tenants.activate(event.reference, event.subscriptionId);
+  }
+
+  @OnPaymentEvent(['subscription.past_due', 'subscription.payment_failed'])
+  async warn(event: PaymentEvent) {}
+
+  @OnPaymentEvent(['subscription.canceled', 'subscription.expired'])
+  async revokeAccess(event: PaymentEvent) {}
+}
+```
+
+Manage them later:
+
+```ts
+await payments.getSubscription('stripe', 'sub_123');
+await payments.findSubscriptionByReference('mercadopago', tenant.id);
+await payments.cancelSubscription('stripe', { subscriptionId: 'sub_123', atPeriodEnd: true });
+await payments.pauseSubscription('paypal', 'I-BW452GLLEP1G');
+await payments.resumeSubscription('paypal', 'I-BW452GLLEP1G');
+```
+
+|                                     | Stripe                         | Mercado Pago                                 | PayPal                         |
+| ----------------------------------- | ------------------------------ | -------------------------------------------- | ------------------------------ |
+| Plan                                | Recurring Price (`price_…`)    | Preapproval plan                             | Product + billing plan (`P-…`) |
+| Inline plan in `createSubscription` | ✅                             | ✅                                           | — (plan id required)           |
+| Intervals                           | day, week, month, year         | day, week, month, year (sent as days/months) | day, week, month, year         |
+| Trial days                          | ✅                             | ✅                                           | ✅ (≤ 365)                     |
+| `totalCycles`                       | — (use Subscription Schedules) | ✅                                           | ✅                             |
+| Customer authorizes at              | Stripe Checkout                | Mercado Pago (any saved method)              | PayPal                         |
+| Find by reference                   | ✅ Search API                  | ✅                                           | — (store the id)               |
+| Cancel at period end                | ✅                             | — (immediate)                                | — (immediate)                  |
+| Pause / resume                      | ✅ (`pause_collection`)        | ✅                                           | ✅ (suspend / activate)        |
+
+`subscription.activated` is emitted when a subscription becomes active or trialing — including after a resume — so handlers should be idempotent. Wompi and PayU don't offer hosted recurring billing; calling these methods on them throws `UnsupportedOperationError`.
+
 ## Webhook URLs
 
-| Provider     | Configure this URL                               | Where                                                                                                         |
-| ------------ | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| Wompi        | `https://your.app/payments/webhooks/wompi`       | Dashboard → Developers → Events URL                                                                           |
-| Mercado Pago | `https://your.app/payments/webhooks/mercadopago` | Your integrations → Webhooks (event: Payments). Also sent as `notification_url` if you pass `notificationUrl` |
-| PayU         | `https://your.app/payments/webhooks/payu`        | Sent per transaction as `confirmationUrl` — pass `notificationUrl`                                            |
-| Stripe       | `https://your.app/payments/webhooks/stripe`      | Developers → Webhooks. Events: `checkout.session.*`, `payment_intent.*`, `charge.refunded`                    |
-| PayPal       | `https://your.app/payments/webhooks/paypal`      | App → Webhooks. Events: `CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.*`                                        |
+| Provider     | Configure this URL                               | Where                                                                                                                                                                                                      |
+| ------------ | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wompi        | `https://your.app/payments/webhooks/wompi`       | Dashboard → Developers → Events URL                                                                                                                                                                        |
+| Mercado Pago | `https://your.app/payments/webhooks/mercadopago` | Your integrations → Webhooks. Topics: Payments, and Plans and subscriptions (`subscription_preapproval`, `subscription_authorized_payment`). Also sent as `notification_url` if you pass `notificationUrl` |
+| PayU         | `https://your.app/payments/webhooks/payu`        | Sent per transaction as `confirmationUrl` — pass `notificationUrl`                                                                                                                                         |
+| Stripe       | `https://your.app/payments/webhooks/stripe`      | Developers → Webhooks. Events: `checkout.session.*`, `payment_intent.*`, `charge.refunded`; subscriptions: `customer.subscription.*`, `invoice.paid`, `invoice.payment_failed`                             |
+| PayPal       | `https://your.app/payments/webhooks/paypal`      | App → Webhooks. Events: `CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.*`; subscriptions: `BILLING.SUBSCRIPTION.*`, `PAYMENT.SALE.COMPLETED`, `PAYMENT.SALE.DENIED`                                           |
 
 Change the base path with `PaymentsModule.forRoot({ ...options, webhooks: { path: 'hooks/pay' } })`, or disable the controller with `{ webhooks: false }` and call `payments.handleWebhook(provider, { headers, rawBody })` yourself.
 
 ## Normalized model
 
-**Statuses**: `pending`, `requires_action`, `authorized`, `succeeded`, `failed`, `canceled`, `expired`, `refunded`, `partially_refunded`.
+**Payment statuses**: `pending`, `requires_action`, `authorized`, `succeeded`, `failed`, `canceled`, `expired`, `refunded`, `partially_refunded`.
 
-**Events**: `payment.pending`, `payment.authorized`, `payment.succeeded`, `payment.failed`, `payment.canceled`, `payment.expired`, `payment.refunded`, `payment.partially_refunded`, plus `unknown` for provider events outside the payment lifecycle (always available in `event.providerType` / `event.raw`).
+**Events**: `payment.pending`, `payment.authorized`, `payment.succeeded`, `payment.failed`, `payment.canceled`, `payment.expired`, `payment.refunded`, `payment.partially_refunded`.
+
+**Subscription statuses**: `pending`, `trialing`, `active`, `past_due`, `paused`, `canceled`, `expired`.
+
+**Subscription events**: `subscription.pending`, `subscription.activated`, `subscription.updated`, `subscription.past_due`, `subscription.paused`, `subscription.canceled`, `subscription.expired`, `subscription.payment_succeeded`, `subscription.payment_failed` — with `event.subscriptionId` and, when available, `event.subscription`.
+
+Provider events outside these lifecycles arrive as `unknown` (always available in `event.providerType` / `event.raw`).
 
 **Money**: integers in the currency's minor unit. `toMinorUnits('150000.50', 'COP')` → `15000050`; `toDecimalString(15000050, 'COP')` → `'150000.50'`. Zero-decimal (CLP, JPY…) and three-decimal (KWD…) currencies are handled.
 
@@ -178,6 +249,15 @@ payments.getPayment(provider, paymentId)          // Payment
 payments.findByReference(provider, reference)     // Payment | null
 payments.refund(provider, { paymentId, amount?, reason? })
 payments.capture('paypal', orderId)
+
+payments.createPlan(request, provider?)           // Plan
+payments.getPlan(provider, planId)
+payments.createSubscription(request, provider?)   // SubscriptionSession { id, url, raw }
+payments.getSubscription(provider, subscriptionId)
+payments.findSubscriptionByReference(provider, reference)
+payments.cancelSubscription(provider, { subscriptionId, atPeriodEnd?, reason? })
+payments.pauseSubscription(provider, subscriptionId)
+payments.resumeSubscription(provider, subscriptionId)
 payments.provider('stripe')                       // the raw adapter
 ```
 

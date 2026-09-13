@@ -2,12 +2,18 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PaymentsConfigurationError, UnsupportedOperationError } from '../core/errors.js';
 import type { PaymentProvider } from '../core/provider.js';
 import type {
+  CancelSubscriptionRequest,
   CheckoutRequest,
   CheckoutSession,
   Payment,
   PaymentEvent,
+  Plan,
+  PlanRequest,
   Refund,
   RefundRequest,
+  Subscription,
+  SubscriptionRequest,
+  SubscriptionSession,
   WebhookRequest,
 } from '../core/types.js';
 import { PayPalProvider } from '../providers/paypal/paypal.provider.js';
@@ -15,6 +21,16 @@ import type { ProviderRegistry } from '../registry.js';
 import { PAYMENTS_OPTIONS, PAYMENTS_REGISTRY } from './constants.js';
 import type { PaymentsModuleOptions } from './interfaces.js';
 import { PaymentEventsService } from './payment-events.service.js';
+
+type SubscriptionMethod =
+  | 'createPlan'
+  | 'getPlan'
+  | 'createSubscription'
+  | 'getSubscription'
+  | 'findSubscriptionByReference'
+  | 'cancelSubscription'
+  | 'pauseSubscription'
+  | 'resumeSubscription';
 
 @Injectable()
 export class PaymentsService {
@@ -72,6 +88,51 @@ export class PaymentsService {
     const adapter = this.provider(provider);
     if (!adapter.capture) throw new UnsupportedOperationError(adapter.name, 'capture');
     return adapter.capture(paymentId);
+  }
+
+  async createPlan(request: PlanRequest, provider?: string): Promise<Plan> {
+    return this.subscriptionMethod(provider, 'createPlan')(request);
+  }
+
+  async getPlan(provider: string, planId: string): Promise<Plan> {
+    return this.subscriptionMethod(provider, 'getPlan')(planId);
+  }
+
+  /** Returns the URL where the customer authorizes the subscription. */
+  async createSubscription(request: SubscriptionRequest, provider?: string): Promise<SubscriptionSession> {
+    return this.subscriptionMethod(provider, 'createSubscription')(request);
+  }
+
+  async getSubscription(provider: string, subscriptionId: string): Promise<Subscription> {
+    return this.subscriptionMethod(provider, 'getSubscription')(subscriptionId);
+  }
+
+  async findSubscriptionByReference(provider: string, reference: string): Promise<Subscription | null> {
+    return this.subscriptionMethod(provider, 'findSubscriptionByReference')(reference);
+  }
+
+  async cancelSubscription(provider: string, request: CancelSubscriptionRequest): Promise<Subscription> {
+    return this.subscriptionMethod(provider, 'cancelSubscription')(request);
+  }
+
+  async pauseSubscription(provider: string, subscriptionId: string): Promise<Subscription> {
+    return this.subscriptionMethod(provider, 'pauseSubscription')(subscriptionId);
+  }
+
+  async resumeSubscription(provider: string, subscriptionId: string): Promise<Subscription> {
+    return this.subscriptionMethod(provider, 'resumeSubscription')(subscriptionId);
+  }
+
+  private subscriptionMethod<K extends SubscriptionMethod>(
+    providerName: string | undefined,
+    method: K,
+  ): NonNullable<PaymentProvider[K]> {
+    const adapter = this.provider(providerName);
+    const fn = adapter[method];
+    if (typeof fn !== 'function') {
+      throw new UnsupportedOperationError(adapter.name, method, `${adapter.name} does not support subscriptions`);
+    }
+    return (fn as (...args: unknown[]) => unknown).bind(adapter) as NonNullable<PaymentProvider[K]>;
   }
 
   /**

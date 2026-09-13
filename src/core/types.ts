@@ -28,7 +28,24 @@ export type PaymentEventType =
   | 'payment.expired'
   | 'payment.refunded'
   | 'payment.partially_refunded'
+  | SubscriptionEventType
   | 'unknown';
+
+export type SubscriptionEventType =
+  /** Created, waiting for the customer to authorize it. */
+  | 'subscription.pending'
+  /** Authorized: active or trialing (also sent when it becomes active again). */
+  | 'subscription.activated'
+  /** Any other change (plan, quantity, billing dates…). */
+  | 'subscription.updated'
+  | 'subscription.past_due'
+  | 'subscription.paused'
+  | 'subscription.canceled'
+  | 'subscription.expired'
+  /** A recurring charge was collected. */
+  | 'subscription.payment_succeeded'
+  /** A recurring charge failed; the provider may retry. */
+  | 'subscription.payment_failed';
 
 export interface Customer {
   email?: string;
@@ -142,6 +159,10 @@ export interface PaymentEvent {
   occurredAt?: Date;
   /** The payment fetched from the provider, when the adapter hydrated it. */
   payment?: Payment;
+  /** Set on `subscription.*` events. */
+  subscriptionId?: string;
+  /** The subscription, when the payload carries it or the adapter hydrated it. */
+  subscription?: Subscription;
   raw: unknown;
 }
 
@@ -153,6 +174,106 @@ export interface ProviderCapabilities {
   partialRefund: boolean;
   capture: boolean;
   webhooks: boolean;
+  /** Plans and recurring subscriptions. */
+  subscriptions?: boolean;
 }
 
 export type ProviderEnvironment = 'sandbox' | 'production';
+
+export type BillingInterval = 'day' | 'week' | 'month' | 'year';
+
+export interface PlanRequest {
+  name: string;
+  description?: string;
+  /** Price per billing period in minor units. */
+  amount: number;
+  currency: string;
+  interval: BillingInterval;
+  /** Bill every N intervals, e.g. `interval: 'month', intervalCount: 3` for quarterly. Default 1. */
+  intervalCount?: number;
+  /** Free days before the first charge. */
+  trialDays?: number;
+  /** Number of charges before the subscription ends. Omit to renew until canceled. */
+  totalCycles?: number;
+  metadata?: Record<string, string>;
+  idempotencyKey?: string;
+  /** Escape hatch: raw provider-specific fields merged into the request. */
+  providerOptions?: Record<string, unknown>;
+}
+
+export interface Plan {
+  provider: ProviderName;
+  /** Use it as `plan` in `createSubscription`. Stripe: price id; Mercado Pago: preapproval plan id; PayPal: plan id. */
+  id: string;
+  name?: string;
+  amount?: number;
+  currency?: string;
+  interval?: BillingInterval;
+  intervalCount?: number;
+  trialDays?: number;
+  totalCycles?: number;
+  active: boolean;
+  raw: unknown;
+}
+
+export type SubscriptionStatus = 'pending' | 'trialing' | 'active' | 'past_due' | 'paused' | 'canceled' | 'expired';
+
+/** A plan defined in place, for providers that accept it (Stripe, Mercado Pago). */
+export type InlinePlan = Omit<PlanRequest, 'idempotencyKey' | 'providerOptions' | 'metadata'>;
+
+export interface SubscriptionRequest {
+  /** Your own identifier (account, tenant, order). Comes back on every subscription event. */
+  reference: string;
+  /** A plan id (from `createPlan` or the provider dashboard) or an inline plan. */
+  plan: string | InlinePlan;
+  /** Mercado Pago requires `customer.email`. */
+  customer?: Customer;
+  /** Where the customer lands after authorizing. Required by Stripe and Mercado Pago. */
+  successUrl?: string;
+  cancelUrl?: string;
+  metadata?: Record<string, string>;
+  idempotencyKey?: string;
+  providerOptions?: Record<string, unknown>;
+}
+
+/** Redirect the customer to `url` to authorize the subscription. */
+export interface SubscriptionSession {
+  provider: ProviderName;
+  /**
+   * Stripe: Checkout Session id (`cs_…`, the subscription is created on completion);
+   * Mercado Pago: preapproval id; PayPal: subscription id.
+   */
+  id: string;
+  reference: string;
+  url?: string;
+  raw: unknown;
+}
+
+export interface Subscription {
+  provider: ProviderName;
+  id: string;
+  reference?: string;
+  status: SubscriptionStatus;
+  planId?: string;
+  /** Recurring amount in minor units, when the provider reports it. */
+  amount?: number;
+  currency?: string;
+  interval?: BillingInterval;
+  intervalCount?: number;
+  /** End of the period already paid for. */
+  currentPeriodEnd?: Date;
+  nextBillingAt?: Date;
+  /** Cancellation is scheduled for the end of the current period. */
+  cancelAtPeriodEnd?: boolean;
+  canceledAt?: Date;
+  customerEmail?: string;
+  createdAt?: Date;
+  raw: unknown;
+}
+
+export interface CancelSubscriptionRequest {
+  subscriptionId: string;
+  /** Keep access until the paid period ends (Stripe only). Default: cancel now. */
+  atPeriodEnd?: boolean;
+  reason?: string;
+}

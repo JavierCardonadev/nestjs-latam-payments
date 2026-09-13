@@ -1,18 +1,34 @@
 import { randomUUID } from 'node:crypto';
 import { hmacSha256Hex, safeEqual } from '../../core/crypto.js';
-import { PaymentsConfigurationError, WebhookVerificationError } from '../../core/errors.js';
+import {
+  PaymentsConfigurationError,
+  PaymentValidationError,
+  UnsupportedOperationError,
+  WebhookVerificationError,
+} from '../../core/errors.js';
 import { getHeader, HttpClient, type HttpClientOptions } from '../../core/http.js';
 import { assertMinorUnits, normalizeCurrency, toDecimalString, toMinorUnits } from '../../core/money.js';
 import type { PaymentProvider } from '../../core/provider.js';
+import { normalizePlan, subscriptionEventForStatus } from '../../core/subscriptions.js';
 import type {
+  BillingInterval,
+  CancelSubscriptionRequest,
   CheckoutRequest,
+  InlinePlan,
   CheckoutSession,
   Payment,
   PaymentEvent,
+  PaymentEventType,
   PaymentStatus,
+  Plan,
+  PlanRequest,
   ProviderCapabilities,
   Refund,
   RefundRequest,
+  Subscription,
+  SubscriptionRequest,
+  SubscriptionSession,
+  SubscriptionStatus,
   WebhookRequest,
 } from '../../core/types.js';
 import {
@@ -56,6 +72,21 @@ const STATUS: Record<string, PaymentStatus> = {
   charged_back: 'refunded',
 };
 
+const SUBSCRIPTION_STATUS: Record<string, SubscriptionStatus> = {
+  pending: 'pending',
+  authorized: 'active',
+  paused: 'paused',
+  cancelled: 'canceled',
+};
+
+// Mercado Pago only bills in days or months.
+const FREQUENCY: Record<BillingInterval, { multiplier: number; type: 'days' | 'months' }> = {
+  day: { multiplier: 1, type: 'days' },
+  week: { multiplier: 7, type: 'days' },
+  month: { multiplier: 1, type: 'months' },
+  year: { multiplier: 12, type: 'months' },
+};
+
 /** Mercado Pago (AR, BR, CL, CO, MX, PE, UY): Checkout Pro, Pix, cash and cards. */
 export class MercadoPagoProvider implements PaymentProvider {
   readonly name = 'mercadopago';
@@ -67,6 +98,7 @@ export class MercadoPagoProvider implements PaymentProvider {
     partialRefund: true,
     capture: false,
     webhooks: true,
+    subscriptions: true,
   };
 
   private readonly http: HttpClient;
@@ -246,26 +278,267 @@ export class MercadoPagoProvider implements PaymentProvider {
 
     const topic = String(body?.type ?? body?.topic ?? queryValue(request.query, 'type') ?? '');
     const providerType = String(body?.action ?? topic);
-    const hydrate = this.config.hydrateWebhooks !== false;
+    const hydrate = this.config.hydrateWebhooks !== false && dataId !== undefined;
 
-    let payment: Payment | undefined;
-    if (topic === 'payment' && dataId && hydrate) {
-      payment = await this.getPayment(dataId);
-    }
-
-    return {
+    const event: PaymentEvent = {
       provider: this.name,
       id: String(body?.id ?? getHeader(request.headers, 'x-request-id') ?? `${topic}:${dataId}`),
-      type: eventTypeForStatus(payment?.status),
+      type: 'unknown',
       providerType,
-      paymentId: topic === 'payment' ? dataId : undefined,
-      reference: payment?.reference,
-      status: payment?.status,
-      amount: payment?.amount,
-      currency: payment?.currency,
       occurredAt: dateFromIso(body?.date_created),
-      payment,
       raw: body,
+    };
+
+    if (topic === 'payment') {
+      const payment = hydrate ? await this.getPayment(dataId) : undefined;
+      return {
+        ...event,
+        type: eventTypeForStatus(payment?.status),
+        paymentId: dataId,
+        reference: payment?.reference,
+        status: payment?.status,
+        amount: payment?.amount,
+        currency: payment?.currency,
+        payment,
+      };
+    }
+
+    if (topic === 'subscription_preapproval') {
+      const subscription = hydrate ? await this.getSubscription(dataId) : undefined;
+      return {
+        ...event,
+        type: subscription ? subscriptionEventForStatus(subscription.status) : 'unknown',
+        subscriptionId: dataId,
+        reference: subscription?.reference,
+        amount: subscription?.amount,
+        currency: subscription?.currency,
+        subscription,
+      };
+    }
+
+    if (topic === 'subscription_authorized_payment' && hydrate) {
+      // One billing cycle of a subscription ("invoice"): its payment tells whether the charge went through.
+      const { data: invoice } = await this.http.request<Record<string, any>>({
+        method: 'GET',
+        url: `${this.baseUrl}/authorized_payments/${encodeURIComponent(dataId)}`,
+        headers: this.auth,
+      });
+      const paymentStatus = invoice.payment?.status;
+      const type: PaymentEventType =
+        paymentStatus === 'approved'
+          ? 'subscription.payment_succeeded'
+          : paymentStatus === 'rejected'
+            ? 'subscription.payment_failed'
+            : 'unknown';
+      const currency: string | undefined = invoice.currency_id;
+      return {
+        ...event,
+        type,
+        paymentId: invoice.payment?.id !== undefined ? String(invoice.payment.id) : undefined,
+        subscriptionId: invoice.preapproval_id,
+        reference: invoice.external_reference || undefined,
+        amount:
+          currency && invoice.transaction_amount !== undefined
+            ? toMinorUnits(invoice.transaction_amount, currency)
+            : undefined,
+        currency,
+      };
+    }
+
+    return event;
+  }
+
+  /** Creates a preapproval plan. Pass `providerOptions: { back_url }` if your account requires one. */
+  async createPlan(request: PlanRequest): Promise<Plan> {
+    const plan = normalizePlan(request);
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'POST',
+      url: `${this.baseUrl}/preapproval_plan`,
+      headers: { ...this.auth, 'X-Idempotency-Key': request.idempotencyKey },
+      json: { reason: plan.name, auto_recurring: this.autoRecurring(plan), ...request.providerOptions },
+    });
+    return this.toPlan(data);
+  }
+
+  async getPlan(planId: string): Promise<Plan> {
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'GET',
+      url: `${this.baseUrl}/preapproval_plan/${encodeURIComponent(requireNonEmpty(planId, 'planId'))}`,
+      headers: this.auth,
+    });
+    return this.toPlan(data);
+  }
+
+  /**
+   * Subscription with pending payment: the customer authorizes it at `url` with the payment method they choose.
+   * With a plan id, the plan's price and frequency are copied so the subscription keeps your `reference`.
+   */
+  async createSubscription(request: SubscriptionRequest): Promise<SubscriptionSession> {
+    const reference = requireNonEmpty(request.reference, 'reference');
+    const email = request.customer?.email;
+    if (!email) throw new PaymentValidationError('mercadopago: customer.email is required for subscriptions');
+    if (!request.successUrl) throw new PaymentValidationError('mercadopago: successUrl is required (back_url)');
+
+    let reason: string;
+    let autoRecurring: Record<string, unknown>;
+    if (typeof request.plan === 'string') {
+      const plan = (await this.getPlan(request.plan)).raw as Record<string, any>;
+      const { frequency, frequency_type, transaction_amount, currency_id, repetitions, free_trial } =
+        plan.auto_recurring ?? {};
+      reason = plan.reason;
+      autoRecurring = { frequency, frequency_type, transaction_amount, currency_id, repetitions, free_trial };
+    } else {
+      const plan = normalizePlan(request.plan);
+      reason = plan.name;
+      autoRecurring = this.autoRecurring(plan);
+    }
+
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'POST',
+      url: `${this.baseUrl}/preapproval`,
+      headers: { ...this.auth, 'X-Idempotency-Key': request.idempotencyKey },
+      json: {
+        reason,
+        external_reference: reference,
+        payer_email: email,
+        auto_recurring: autoRecurring,
+        back_url: request.successUrl,
+        status: 'pending',
+        ...request.providerOptions,
+      },
+    });
+    return {
+      provider: this.name,
+      id: String(data.id),
+      reference,
+      url: (this.config.useSandboxInitPoint && data.sandbox_init_point) || data.init_point,
+      raw: data,
+    };
+  }
+
+  async getSubscription(subscriptionId: string): Promise<Subscription> {
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'GET',
+      url: `${this.baseUrl}/preapproval/${encodeURIComponent(requireNonEmpty(subscriptionId, 'subscriptionId'))}`,
+      headers: this.auth,
+    });
+    return this.toSubscription(data);
+  }
+
+  /** Most recent subscription with this `external_reference`. */
+  async findSubscriptionByReference(reference: string): Promise<Subscription | null> {
+    const { data } = await this.http.request<{ results?: Array<Record<string, any>> }>({
+      method: 'GET',
+      url: `${this.baseUrl}/preapproval/search`,
+      headers: this.auth,
+      query: { external_reference: requireNonEmpty(reference, 'reference') },
+    });
+    const latest = [...(data.results ?? [])].sort((a, b) =>
+      String(b.date_created ?? '').localeCompare(String(a.date_created ?? '')),
+    )[0];
+    return latest ? this.toSubscription(latest) : null;
+  }
+
+  async cancelSubscription(request: CancelSubscriptionRequest): Promise<Subscription> {
+    if (request.atPeriodEnd) {
+      throw new UnsupportedOperationError(this.name, 'cancel at period end', 'Mercado Pago cancels immediately');
+    }
+    return this.setSubscriptionStatus(request.subscriptionId, 'cancelled');
+  }
+
+  async pauseSubscription(subscriptionId: string): Promise<Subscription> {
+    return this.setSubscriptionStatus(subscriptionId, 'paused');
+  }
+
+  async resumeSubscription(subscriptionId: string): Promise<Subscription> {
+    return this.setSubscriptionStatus(subscriptionId, 'authorized');
+  }
+
+  private async setSubscriptionStatus(subscriptionId: string, status: string): Promise<Subscription> {
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'PUT',
+      url: `${this.baseUrl}/preapproval/${encodeURIComponent(requireNonEmpty(subscriptionId, 'subscriptionId'))}`,
+      headers: this.auth,
+      json: { status },
+    });
+    return this.toSubscription(data);
+  }
+
+  private autoRecurring(plan: InlinePlan & { currency: string; intervalCount: number }): Record<string, unknown> {
+    const frequency = FREQUENCY[plan.interval];
+    return {
+      frequency: plan.intervalCount * frequency.multiplier,
+      frequency_type: frequency.type,
+      transaction_amount: Number(toDecimalString(plan.amount, plan.currency)),
+      currency_id: plan.currency,
+      repetitions: plan.totalCycles,
+      free_trial: plan.trialDays ? { frequency: plan.trialDays, frequency_type: 'days' } : undefined,
+    };
+  }
+
+  private recurrence(auto: Record<string, any> | undefined) {
+    const currency: string | undefined = auto?.currency_id;
+    const frequency = Number(auto?.frequency) || undefined;
+    let interval: BillingInterval | undefined;
+    let intervalCount = frequency;
+    if (frequency && auto?.frequency_type === 'months') {
+      [interval, intervalCount] = frequency % 12 === 0 ? ['year', frequency / 12] : ['month', frequency];
+    } else if (frequency && auto?.frequency_type === 'days') {
+      [interval, intervalCount] = frequency % 7 === 0 ? ['week', frequency / 7] : ['day', frequency];
+    }
+    const trial = auto?.free_trial;
+    return {
+      amount:
+        currency && auto?.transaction_amount !== undefined
+          ? toMinorUnits(auto.transaction_amount, currency)
+          : undefined,
+      currency,
+      interval,
+      intervalCount: interval ? intervalCount : undefined,
+      trialDays:
+        trial?.frequency_type === 'days'
+          ? Number(trial.frequency)
+          : trial?.frequency_type === 'months'
+            ? Number(trial.frequency) * 30
+            : undefined,
+    };
+  }
+
+  private toPlan(data: Record<string, any>): Plan {
+    const { amount, currency, interval, intervalCount, trialDays } = this.recurrence(data.auto_recurring);
+    return {
+      provider: this.name,
+      id: String(data.id),
+      name: data.reason,
+      amount,
+      currency,
+      interval,
+      intervalCount,
+      trialDays,
+      totalCycles: data.auto_recurring?.repetitions ?? undefined,
+      active: data.status === 'active',
+      raw: data,
+    };
+  }
+
+  private toSubscription(data: Record<string, any>): Subscription {
+    const { amount, currency, interval, intervalCount } = this.recurrence(data.auto_recurring);
+    const status = SUBSCRIPTION_STATUS[String(data.status)] ?? 'pending';
+    return {
+      provider: this.name,
+      id: String(data.id),
+      reference: data.external_reference || undefined,
+      status,
+      planId: data.preapproval_plan_id || undefined,
+      amount,
+      currency,
+      interval,
+      intervalCount,
+      nextBillingAt: status === 'active' ? dateFromIso(data.next_payment_date) : undefined,
+      canceledAt: status === 'canceled' ? dateFromIso(data.last_modified) : undefined,
+      customerEmail: data.payer_email || undefined,
+      createdAt: dateFromIso(data.date_created),
+      raw: data,
     };
   }
 

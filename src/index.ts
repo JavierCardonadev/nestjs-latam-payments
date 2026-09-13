@@ -4,6 +4,7 @@ export * from './core/errors.js';
 export { HttpClient, getHeader, type FetchLike, type HttpClientOptions } from './core/http.js';
 export { currencyDecimals, toDecimalString, toMinorUnits } from './core/money.js';
 export { renderCheckoutForm } from './core/utils.js';
+export { normalizePlan, subscriptionEventForStatus } from './core/subscriptions.js';
 // Building blocks for custom providers.
 export { hashHex, hmacSha256Hex, safeEqual, type HashAlgorithm } from './core/crypto.js';
 

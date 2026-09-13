@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-13
+
+### Added
+
+- Subscriptions for Stripe, Mercado Pago and PayPal: `createPlan`, `getPlan`, `createSubscription`, `getSubscription`, `findSubscriptionByReference`, `cancelSubscription`, `pauseSubscription` and `resumeSubscription`, with inline plans, trials and billing cycles where each provider supports them.
+- `subscription.*` events (`pending`, `activated`, `updated`, `past_due`, `paused`, `canceled`, `expired`, `payment_succeeded`, `payment_failed`) with `event.subscriptionId` and `event.subscription`, from `customer.subscription.*`/`invoice.*` (Stripe), `subscription_preapproval`/`subscription_authorized_payment` (Mercado Pago) and `BILLING.SUBSCRIPTION.*`/`PAYMENT.SALE.*` (PayPal).
+- Optional `subscriptions` capability and subscription methods on the `PaymentProvider` interface.
+
+### Changed
+
+- Stripe `checkout.session.*` events in subscription mode are no longer reported as one-off `payment.*` events.
+
 ## [0.1.0] - 2026-09-13
 
 ### Added

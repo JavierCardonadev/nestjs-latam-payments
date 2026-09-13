@@ -15,17 +15,26 @@ import {
   toMinorUnits,
 } from '../../core/money.js';
 import type { PaymentProvider } from '../../core/provider.js';
+import { normalizePlan } from '../../core/subscriptions.js';
 import type {
+  BillingInterval,
+  CancelSubscriptionRequest,
   CheckoutRequest,
   CheckoutSession,
   Payment,
   PaymentEvent,
   PaymentEventType,
   PaymentStatus,
+  Plan,
+  PlanRequest,
   ProviderCapabilities,
   ProviderEnvironment,
   Refund,
   RefundRequest,
+  Subscription,
+  SubscriptionRequest,
+  SubscriptionSession,
+  SubscriptionStatus,
   WebhookRequest,
 } from '../../core/types.js';
 import { dateFromIso, parseJsonWebhook, requireConfig, requireNonEmpty } from '../../core/utils.js';
@@ -76,6 +85,26 @@ const PAYPAL_NO_DECIMALS = new Set(['HUF', 'JPY', 'TWD']);
 
 const CERT_HOST = /^(api|api-m)(\.sandbox)?\.paypal\.com$/;
 
+const SUBSCRIPTION_STATUS: Record<string, SubscriptionStatus> = {
+  APPROVAL_PENDING: 'pending',
+  APPROVED: 'pending',
+  ACTIVE: 'active',
+  SUSPENDED: 'paused',
+  CANCELLED: 'canceled',
+  EXPIRED: 'expired',
+};
+
+const SUBSCRIPTION_EVENTS: Record<string, PaymentEventType> = {
+  'BILLING.SUBSCRIPTION.CREATED': 'subscription.pending',
+  'BILLING.SUBSCRIPTION.ACTIVATED': 'subscription.activated',
+  'BILLING.SUBSCRIPTION.RE-ACTIVATED': 'subscription.activated',
+  'BILLING.SUBSCRIPTION.UPDATED': 'subscription.updated',
+  'BILLING.SUBSCRIPTION.SUSPENDED': 'subscription.paused',
+  'BILLING.SUBSCRIPTION.CANCELLED': 'subscription.canceled',
+  'BILLING.SUBSCRIPTION.EXPIRED': 'subscription.expired',
+  'BILLING.SUBSCRIPTION.PAYMENT.FAILED': 'subscription.payment_failed',
+};
+
 export class PayPalProvider implements PaymentProvider {
   readonly name = 'paypal';
   readonly capabilities: ProviderCapabilities = {
@@ -86,6 +115,7 @@ export class PayPalProvider implements PaymentProvider {
     partialRefund: true,
     capture: true,
     webhooks: true,
+    subscriptions: true,
   };
 
   readonly environment: ProviderEnvironment;
@@ -350,6 +380,44 @@ export class PayPalProvider implements PaymentProvider {
     const event = parseJsonWebhook(this.name, request);
     const eventType = String(event?.event_type ?? '');
     const resource = event?.resource ?? {};
+    const base = {
+      provider: this.name,
+      id: String(event?.id),
+      providerType: eventType,
+      occurredAt: dateFromIso(event?.create_time),
+      raw: event,
+    };
+
+    if (eventType.startsWith('BILLING.SUBSCRIPTION.')) {
+      const subscription = this.toSubscription(resource);
+      return {
+        ...base,
+        type: SUBSCRIPTION_EVENTS[eventType] ?? 'unknown',
+        subscriptionId: subscription.id,
+        reference: subscription.reference,
+        amount: subscription.amount,
+        currency: subscription.currency,
+        subscription,
+      };
+    }
+
+    // Recurring charges of a subscription are reported as sales tied to its billing agreement.
+    if (eventType.startsWith('PAYMENT.SALE.') && resource.billing_agreement_id) {
+      const currency: string | undefined = resource.amount?.currency;
+      const types: Record<string, PaymentEventType> = {
+        'PAYMENT.SALE.COMPLETED': 'subscription.payment_succeeded',
+        'PAYMENT.SALE.DENIED': 'subscription.payment_failed',
+      };
+      return {
+        ...base,
+        type: types[eventType] ?? 'unknown',
+        paymentId: resource.id,
+        subscriptionId: resource.billing_agreement_id,
+        reference: resource.custom || undefined,
+        amount: resource.amount?.total && currency ? toMinorUnits(resource.amount.total, currency) : undefined,
+        currency,
+      };
+    }
 
     const types: Record<string, PaymentEventType> = {
       'CHECKOUT.ORDER.APPROVED': 'payment.authorized',
@@ -369,17 +437,215 @@ export class PayPalProvider implements PaymentProvider {
     const currency: string | undefined = money?.currency_code;
 
     return {
-      provider: this.name,
-      id: String(event?.id),
+      ...base,
       type,
-      providerType: eventType,
       paymentId: isOrder ? resource.id : resource.supplementary_data?.related_ids?.order_id,
       reference: isOrder ? (unit?.custom_id ?? unit?.reference_id) : resource.custom_id,
       status: type === 'unknown' ? undefined : (type.slice('payment.'.length) as PaymentStatus),
       amount: money?.value && currency ? toMinorUnits(money.value, currency) : undefined,
       currency,
-      occurredAt: dateFromIso(event?.create_time),
-      raw: event,
+    };
+  }
+
+  /**
+   * Creates a catalog product and a billing plan. Reuse a product with `providerOptions: { productId }`.
+   */
+  async createPlan(request: PlanRequest): Promise<Plan> {
+    const plan = normalizePlan(request);
+    const value = this.toValue(plan.amount, plan.currency);
+    if (plan.trialDays !== undefined && plan.trialDays > 365) {
+      throw new PaymentValidationError('paypal: trialDays must be at most 365');
+    }
+    const { productId, ...providerOptions } = request.providerOptions ?? {};
+
+    let product = productId as string | undefined;
+    if (!product) {
+      const { data } = await this.http.request<Record<string, any>>({
+        method: 'POST',
+        url: `${this.baseUrl}/v1/catalogs/products`,
+        headers: await this.authHeaders(request.idempotencyKey && `${request.idempotencyKey}-product`),
+        json: { name: plan.name.slice(0, 127), description: plan.description?.slice(0, 256), type: 'SERVICE' },
+      });
+      product = data.id as string;
+    }
+
+    const cycles: Array<Record<string, unknown>> = [];
+    if (plan.trialDays) {
+      cycles.push({
+        frequency: { interval_unit: 'DAY', interval_count: plan.trialDays },
+        tenure_type: 'TRIAL',
+        sequence: 1,
+        total_cycles: 1,
+      });
+    }
+    cycles.push({
+      frequency: { interval_unit: plan.interval.toUpperCase(), interval_count: plan.intervalCount },
+      tenure_type: 'REGULAR',
+      sequence: cycles.length + 1,
+      total_cycles: plan.totalCycles ?? 0,
+      pricing_scheme: { fixed_price: { value, currency_code: plan.currency } },
+    });
+
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'POST',
+      url: `${this.baseUrl}/v1/billing/plans`,
+      headers: await this.authHeaders(request.idempotencyKey),
+      json: {
+        product_id: product,
+        name: plan.name.slice(0, 127),
+        description: plan.description?.slice(0, 127),
+        status: 'ACTIVE',
+        billing_cycles: cycles,
+        payment_preferences: { auto_bill_outstanding: true, payment_failure_threshold: 3 },
+        ...providerOptions,
+      },
+    });
+    return this.toPlan(data);
+  }
+
+  async getPlan(planId: string): Promise<Plan> {
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'GET',
+      url: `${this.baseUrl}/v1/billing/plans/${encodeURIComponent(requireNonEmpty(planId, 'planId'))}`,
+      headers: await this.authHeaders(),
+    });
+    return this.toPlan(data);
+  }
+
+  /** Requires a plan id (`createPlan` or the PayPal dashboard): PayPal has no inline plans. */
+  async createSubscription(request: SubscriptionRequest): Promise<SubscriptionSession> {
+    const reference = requireNonEmpty(request.reference, 'reference');
+    if (reference.length > 127) throw new PaymentValidationError('paypal: reference must be at most 127 characters');
+    if (typeof request.plan !== 'string') {
+      throw new PaymentValidationError('paypal: subscriptions need a plan id; create one with createPlan()');
+    }
+
+    const [givenName, ...surname] = (request.customer?.name ?? '').trim().split(/\s+/);
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'POST',
+      url: `${this.baseUrl}/v1/billing/subscriptions`,
+      headers: await this.authHeaders(request.idempotencyKey),
+      json: {
+        plan_id: requireNonEmpty(request.plan, 'plan'),
+        custom_id: reference,
+        subscriber: request.customer
+          ? {
+              email_address: request.customer.email,
+              name: givenName ? { given_name: givenName, surname: surname.join(' ') || undefined } : undefined,
+            }
+          : undefined,
+        application_context: {
+          brand_name: this.config.brandName,
+          user_action: 'SUBSCRIBE_NOW',
+          shipping_preference: 'NO_SHIPPING',
+          return_url: request.successUrl,
+          cancel_url: request.cancelUrl,
+        },
+        ...request.providerOptions,
+      },
+    });
+    const links: Array<{ rel: string; href: string }> = data.links ?? [];
+    return {
+      provider: this.name,
+      id: data.id,
+      reference,
+      url: links.find((link) => link.rel === 'approve')?.href,
+      raw: data,
+    };
+  }
+
+  async getSubscription(subscriptionId: string): Promise<Subscription> {
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'GET',
+      url: `${this.baseUrl}/v1/billing/subscriptions/${encodeURIComponent(requireNonEmpty(subscriptionId, 'subscriptionId'))}`,
+      headers: await this.authHeaders(),
+    });
+    return this.toSubscription(data);
+  }
+
+  async findSubscriptionByReference(): Promise<Subscription | null> {
+    throw new UnsupportedOperationError(
+      this.name,
+      'findSubscriptionByReference',
+      'PayPal has no subscription search API; store the subscription id',
+    );
+  }
+
+  async cancelSubscription(request: CancelSubscriptionRequest): Promise<Subscription> {
+    if (request.atPeriodEnd) {
+      throw new UnsupportedOperationError(this.name, 'cancel at period end', 'PayPal cancels immediately');
+    }
+    return this.subscriptionAction(request.subscriptionId, 'cancel', request.reason ?? 'Canceled by the merchant');
+  }
+
+  async pauseSubscription(subscriptionId: string): Promise<Subscription> {
+    return this.subscriptionAction(subscriptionId, 'suspend', 'Paused by the merchant');
+  }
+
+  async resumeSubscription(subscriptionId: string): Promise<Subscription> {
+    return this.subscriptionAction(subscriptionId, 'activate', 'Resumed by the merchant');
+  }
+
+  /** These endpoints answer 204 without a body, so the subscription is read back afterwards. */
+  private async subscriptionAction(subscriptionId: string, action: string, reason: string): Promise<Subscription> {
+    const id = requireNonEmpty(subscriptionId, 'subscriptionId');
+    await this.http.request({
+      method: 'POST',
+      url: `${this.baseUrl}/v1/billing/subscriptions/${encodeURIComponent(id)}/${action}`,
+      headers: await this.authHeaders(),
+      json: { reason: reason.slice(0, 128) },
+    });
+    return this.getSubscription(id);
+  }
+
+  private toPlan(data: Record<string, any>): Plan {
+    const cycles: any[] = data.billing_cycles ?? [];
+    const regular = cycles.find((cycle) => cycle.tenure_type === 'REGULAR');
+    const trial = cycles.find((cycle) => cycle.tenure_type === 'TRIAL');
+    const price = regular?.pricing_scheme?.fixed_price;
+    return {
+      provider: this.name,
+      id: data.id,
+      name: data.name,
+      amount: price?.value && price.currency_code ? toMinorUnits(price.value, price.currency_code) : undefined,
+      currency: price?.currency_code,
+      interval: regular?.frequency?.interval_unit?.toLowerCase() as BillingInterval | undefined,
+      intervalCount: regular?.frequency?.interval_count,
+      trialDays:
+        trial?.frequency?.interval_unit === 'DAY'
+          ? trial.frequency.interval_count * (trial.total_cycles || 1)
+          : undefined,
+      totalCycles: regular?.total_cycles || undefined,
+      active: data.status === 'ACTIVE',
+      raw: data,
+    };
+  }
+
+  private toSubscription(data: Record<string, any>): Subscription {
+    let status = SUBSCRIPTION_STATUS[String(data.status)] ?? 'pending';
+    const executions: any[] = data.billing_info?.cycle_executions ?? [];
+    if (status === 'active' && executions.some((c) => c.tenure_type === 'TRIAL' && c.cycles_remaining > 0)) {
+      status = 'trialing';
+    }
+    const lastPayment = data.billing_info?.last_payment?.amount;
+    const next = dateFromIso(data.billing_info?.next_billing_time);
+    return {
+      provider: this.name,
+      id: data.id,
+      reference: data.custom_id || undefined,
+      status,
+      planId: data.plan_id,
+      amount:
+        lastPayment?.value && lastPayment.currency_code
+          ? toMinorUnits(lastPayment.value, lastPayment.currency_code)
+          : undefined,
+      currency: lastPayment?.currency_code,
+      currentPeriodEnd: status === 'active' || status === 'trialing' ? next : undefined,
+      nextBillingAt: status === 'active' || status === 'trialing' ? next : undefined,
+      canceledAt: status === 'canceled' ? dateFromIso(data.status_update_time) : undefined,
+      customerEmail: data.subscriber?.email_address,
+      createdAt: dateFromIso(data.create_time),
+      raw: data,
     };
   }
 

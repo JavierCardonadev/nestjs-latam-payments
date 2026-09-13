@@ -1,18 +1,27 @@
 import { hmacSha256Hex, safeEqual } from '../../core/crypto.js';
-import { PaymentValidationError, WebhookVerificationError } from '../../core/errors.js';
+import { PaymentValidationError, UnsupportedOperationError, WebhookVerificationError } from '../../core/errors.js';
 import { getHeader, HttpClient, rawBodyToString, type HttpClientOptions } from '../../core/http.js';
 import { assertMinorUnits, normalizeCurrency } from '../../core/money.js';
 import type { PaymentProvider } from '../../core/provider.js';
+import { normalizePlan, subscriptionEventForStatus } from '../../core/subscriptions.js';
 import type {
+  BillingInterval,
+  CancelSubscriptionRequest,
   CheckoutRequest,
   CheckoutSession,
   Payment,
   PaymentEvent,
   PaymentEventType,
   PaymentStatus,
+  Plan,
+  PlanRequest,
   ProviderCapabilities,
   Refund,
   RefundRequest,
+  Subscription,
+  SubscriptionRequest,
+  SubscriptionSession,
+  SubscriptionStatus,
   WebhookRequest,
 } from '../../core/types.js';
 import { dateFromUnixSeconds, parseJsonWebhook, requireConfig, requireNonEmpty } from '../../core/utils.js';
@@ -40,6 +49,17 @@ const INTENT_STATUS: Record<string, PaymentStatus> = {
   succeeded: 'succeeded',
 };
 
+const SUBSCRIPTION_STATUS: Record<string, SubscriptionStatus> = {
+  incomplete: 'pending',
+  incomplete_expired: 'expired',
+  trialing: 'trialing',
+  active: 'active',
+  past_due: 'past_due',
+  unpaid: 'past_due',
+  paused: 'paused',
+  canceled: 'canceled',
+};
+
 /** Stripe Checkout (cards, Pix/Boleto/OXXO where enabled, wallets). */
 export class StripeProvider implements PaymentProvider {
   readonly name = 'stripe';
@@ -51,6 +71,7 @@ export class StripeProvider implements PaymentProvider {
     partialRefund: true,
     capture: false,
     webhooks: true,
+    subscriptions: true,
   };
 
   private readonly http: HttpClient;
@@ -232,7 +253,31 @@ export class StripeProvider implements PaymentProvider {
     let reference: string | undefined = object.metadata?.reference;
     let amount: number | undefined;
 
-    if (eventType.startsWith('checkout.session.')) {
+    let subscriptionId: string | undefined;
+    let subscription: Subscription | undefined;
+
+    if (eventType.startsWith('checkout.session.') && object.mode === 'subscription') {
+      // The lifecycle is reported by customer.subscription.* and invoice.* events.
+      subscriptionId = idOf(object.subscription);
+      reference = object.client_reference_id ?? reference;
+    } else if (eventType.startsWith('customer.subscription.')) {
+      subscription = this.toSubscription(object);
+      subscriptionId = subscription.id;
+      reference = subscription.reference;
+      amount = subscription.amount;
+      type = this.subscriptionEventType(eventType, event?.data?.previous_attributes, subscription.status);
+    } else if (eventType === 'invoice.paid' || eventType === 'invoice.payment_failed') {
+      // API versions from 2025-03 (basil) moved these under invoice.parent.subscription_details.
+      const details = object.parent?.subscription_details ?? object.subscription_details;
+      subscriptionId = idOf(details?.subscription ?? object.subscription);
+      if (subscriptionId) {
+        paymentId = object.id;
+        reference = details?.metadata?.reference ?? reference;
+        const paid = eventType === 'invoice.paid';
+        amount = paid ? object.amount_paid : object.amount_due;
+        type = paid ? 'subscription.payment_succeeded' : 'subscription.payment_failed';
+      }
+    } else if (eventType.startsWith('checkout.session.')) {
       paymentId =
         typeof object.payment_intent === 'string' ? object.payment_intent : (object.payment_intent?.id ?? object.id);
       reference = object.client_reference_id ?? reference;
@@ -276,11 +321,252 @@ export class StripeProvider implements PaymentProvider {
       providerType: eventType,
       paymentId,
       reference,
-      status: type === 'unknown' ? undefined : (type.slice('payment.'.length) as PaymentStatus),
+      status: type.startsWith('payment.') ? (type.slice('payment.'.length) as PaymentStatus) : undefined,
       amount,
-      currency: typeof object.currency === 'string' ? object.currency.toUpperCase() : undefined,
+      currency: typeof object.currency === 'string' ? object.currency.toUpperCase() : subscription?.currency,
       occurredAt: dateFromUnixSeconds(event?.created),
+      subscriptionId,
+      subscription,
       raw: event,
+    };
+  }
+
+  private subscriptionEventType(
+    eventType: string,
+    previous: Record<string, unknown> | undefined,
+    status: SubscriptionStatus,
+  ): PaymentEventType {
+    switch (eventType) {
+      case 'customer.subscription.created':
+      case 'customer.subscription.paused':
+      case 'customer.subscription.resumed':
+        return subscriptionEventForStatus(status);
+      case 'customer.subscription.deleted':
+        return 'subscription.canceled';
+      case 'customer.subscription.updated':
+        // Only a status (or pause) change is a lifecycle transition; anything else is an update.
+        return previous && ('status' in previous || 'pause_collection' in previous)
+          ? subscriptionEventForStatus(status)
+          : 'subscription.updated';
+      default:
+        return 'unknown';
+    }
+  }
+
+  /** Creates a recurring Price (with its Product). The returned id is the price id. */
+  async createPlan(request: PlanRequest): Promise<Plan> {
+    const plan = normalizePlan(request);
+    this.assertNoTotalCycles(plan.totalCycles);
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'POST',
+      url: `${this.baseUrl}/v1/prices`,
+      headers: this.headers(request.idempotencyKey),
+      form: toFormParams({
+        currency: plan.currency.toLowerCase(),
+        unit_amount: plan.amount,
+        recurring: { interval: plan.interval, interval_count: plan.intervalCount },
+        product_data: { name: plan.name },
+        // Trials are applied per subscription in Stripe; the plan remembers the default.
+        metadata: { ...request.metadata, trial_days: plan.trialDays?.toString() },
+        expand: ['product'],
+        ...request.providerOptions,
+      }),
+    });
+    return this.toPlan(data);
+  }
+
+  async getPlan(planId: string): Promise<Plan> {
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'GET',
+      url: `${this.baseUrl}/v1/prices/${encodeURIComponent(requireNonEmpty(planId, 'planId'))}`,
+      headers: this.headers(),
+      query: { 'expand[0]': 'product' },
+    });
+    return this.toPlan(data);
+  }
+
+  /** Hosted Checkout in subscription mode. The subscription id arrives with `customer.subscription.created`. */
+  async createSubscription(request: SubscriptionRequest): Promise<SubscriptionSession> {
+    const reference = requireNonEmpty(request.reference, 'reference');
+    if (!request.successUrl) {
+      throw new PaymentValidationError('stripe: successUrl is required for hosted Checkout');
+    }
+
+    let lineItem: Record<string, unknown>;
+    let trialDays: number | undefined;
+    if (typeof request.plan === 'string') {
+      const plan = await this.getPlan(request.plan);
+      lineItem = { price: plan.id, quantity: 1 };
+      trialDays = plan.trialDays;
+    } else {
+      const plan = normalizePlan(request.plan);
+      this.assertNoTotalCycles(plan.totalCycles);
+      lineItem = {
+        quantity: 1,
+        price_data: {
+          currency: plan.currency.toLowerCase(),
+          unit_amount: plan.amount,
+          recurring: { interval: plan.interval, interval_count: plan.intervalCount },
+          product_data: { name: plan.name },
+        },
+      };
+      trialDays = plan.trialDays;
+    }
+
+    const metadata = { ...request.metadata, reference };
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'POST',
+      url: `${this.baseUrl}/v1/checkout/sessions`,
+      headers: this.headers(request.idempotencyKey),
+      form: toFormParams({
+        mode: 'subscription',
+        success_url: request.successUrl,
+        cancel_url: request.cancelUrl,
+        client_reference_id: reference,
+        customer_email: request.customer?.email,
+        line_items: [lineItem],
+        metadata,
+        subscription_data: { metadata, trial_period_days: trialDays || undefined },
+        ...request.providerOptions,
+      }),
+    });
+    return { provider: this.name, id: data.id, reference, url: data.url, raw: data };
+  }
+
+  /** Accepts a subscription id (`sub_…`) or the Checkout Session id returned by `createSubscription`. */
+  async getSubscription(subscriptionId: string): Promise<Subscription> {
+    const id = requireNonEmpty(subscriptionId, 'subscriptionId');
+    if (id.startsWith('cs_')) {
+      const { data: session } = await this.http.request<Record<string, any>>({
+        method: 'GET',
+        url: `${this.baseUrl}/v1/checkout/sessions/${encodeURIComponent(id)}`,
+        headers: this.headers(),
+        query: { 'expand[0]': 'subscription' },
+      });
+      if (session.subscription && typeof session.subscription === 'object') {
+        return this.toSubscription(session.subscription);
+      }
+      return {
+        provider: this.name,
+        id: session.id,
+        reference: session.client_reference_id ?? session.metadata?.reference,
+        status: session.status === 'expired' ? 'expired' : 'pending',
+        createdAt: dateFromUnixSeconds(session.created),
+        raw: session,
+      };
+    }
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'GET',
+      url: `${this.baseUrl}/v1/subscriptions/${encodeURIComponent(id)}`,
+      headers: this.headers(),
+    });
+    return this.toSubscription(data);
+  }
+
+  /** Uses the Search API (`metadata['reference']`). Search results can lag ~1 minute. */
+  async findSubscriptionByReference(reference: string): Promise<Subscription | null> {
+    const value = requireNonEmpty(reference, 'reference').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const { data } = await this.http.request<{ data?: Array<Record<string, any>> }>({
+      method: 'GET',
+      url: `${this.baseUrl}/v1/subscriptions/search`,
+      headers: this.headers(),
+      query: { query: `metadata['reference']:'${value}'`, limit: 1 },
+    });
+    const subscription = data.data?.[0];
+    return subscription ? this.toSubscription(subscription) : null;
+  }
+
+  async cancelSubscription(request: CancelSubscriptionRequest): Promise<Subscription> {
+    const id = encodeURIComponent(requireNonEmpty(request.subscriptionId, 'subscriptionId'));
+    const details = request.reason ? { comment: request.reason.slice(0, 5000) } : undefined;
+    const { data } = request.atPeriodEnd
+      ? await this.http.request<Record<string, any>>({
+          method: 'POST',
+          url: `${this.baseUrl}/v1/subscriptions/${id}`,
+          headers: this.headers(),
+          form: toFormParams({ cancel_at_period_end: true, cancellation_details: details }),
+        })
+      : await this.http.request<Record<string, any>>({
+          method: 'DELETE',
+          url: `${this.baseUrl}/v1/subscriptions/${id}`,
+          headers: this.headers(),
+          query: details ? { 'cancellation_details[comment]': details.comment } : undefined,
+        });
+    return this.toSubscription(data);
+  }
+
+  /** Pauses collection: invoices are voided until resumed. */
+  async pauseSubscription(subscriptionId: string): Promise<Subscription> {
+    return this.updateSubscription(subscriptionId, { pause_collection: { behavior: 'void' } });
+  }
+
+  async resumeSubscription(subscriptionId: string): Promise<Subscription> {
+    // An empty value unsets pause_collection.
+    return this.updateSubscription(subscriptionId, { pause_collection: '' });
+  }
+
+  private async updateSubscription(subscriptionId: string, params: Record<string, unknown>): Promise<Subscription> {
+    const { data } = await this.http.request<Record<string, any>>({
+      method: 'POST',
+      url: `${this.baseUrl}/v1/subscriptions/${encodeURIComponent(requireNonEmpty(subscriptionId, 'subscriptionId'))}`,
+      headers: this.headers(),
+      form: toFormParams(params),
+    });
+    return this.toSubscription(data);
+  }
+
+  private assertNoTotalCycles(totalCycles: number | undefined): void {
+    if (totalCycles !== undefined) {
+      throw new UnsupportedOperationError(
+        this.name,
+        'totalCycles',
+        'Stripe prices renew until canceled; use a Subscription Schedule via providerOptions',
+      );
+    }
+  }
+
+  private toPlan(price: Record<string, any>): Plan {
+    const trialDays = price.metadata?.trial_days ?? price.recurring?.trial_period_days;
+    return {
+      provider: this.name,
+      id: price.id,
+      name: typeof price.product === 'object' ? price.product?.name : (price.nickname ?? undefined),
+      amount: price.unit_amount ?? undefined,
+      currency: price.currency?.toUpperCase(),
+      interval: price.recurring?.interval as BillingInterval | undefined,
+      intervalCount: price.recurring?.interval_count,
+      trialDays: trialDays !== undefined && trialDays !== null && trialDays !== '' ? Number(trialDays) : undefined,
+      active: price.active !== false,
+      raw: price,
+    };
+  }
+
+  private toSubscription(sub: Record<string, any>): Subscription {
+    const item = sub.items?.data?.[0];
+    const price = item?.price;
+    let status: SubscriptionStatus = SUBSCRIPTION_STATUS[sub.status] ?? 'pending';
+    if (status === 'active' && sub.pause_collection) status = 'paused';
+    // API versions from 2025-03 (basil) moved the billing period to each subscription item.
+    const periodEnd = sub.current_period_end ?? item?.current_period_end;
+    const renews = (status === 'active' || status === 'past_due') && !sub.cancel_at_period_end;
+
+    return {
+      provider: this.name,
+      id: sub.id,
+      reference: sub.metadata?.reference,
+      status,
+      planId: price?.id,
+      amount: typeof price?.unit_amount === 'number' ? price.unit_amount * (item.quantity ?? 1) : undefined,
+      currency: (price?.currency ?? sub.currency)?.toUpperCase(),
+      interval: price?.recurring?.interval,
+      intervalCount: price?.recurring?.interval_count,
+      currentPeriodEnd: dateFromUnixSeconds(periodEnd),
+      nextBillingAt: dateFromUnixSeconds(status === 'trialing' ? sub.trial_end : renews ? periodEnd : undefined),
+      cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
+      canceledAt: dateFromUnixSeconds(sub.canceled_at),
+      customerEmail: typeof sub.customer === 'object' ? (sub.customer?.email ?? undefined) : undefined,
+      createdAt: dateFromUnixSeconds(sub.created),
+      raw: sub,
     };
   }
 
@@ -328,6 +614,14 @@ export class StripeProvider implements PaymentProvider {
       raw: session,
     };
   }
+}
+
+function idOf(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object' && typeof (value as { id?: unknown }).id === 'string') {
+    return (value as { id: string }).id;
+  }
+  return undefined;
 }
 
 /** Flattens nested objects/arrays into Stripe's bracket notation: `a[b][0][c]=v`. */

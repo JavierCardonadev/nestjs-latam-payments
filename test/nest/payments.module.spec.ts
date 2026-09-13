@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { Injectable, type INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PaymentsConfigurationError } from '../../src/core/errors.js';
+import { PaymentsConfigurationError, UnsupportedOperationError } from '../../src/core/errors.js';
 import type { PaymentEvent } from '../../src/core/types.js';
 import { OnPaymentEvent, PaymentEventsService } from '../../src/nest/payment-events.service.js';
 import { PaymentsModule } from '../../src/nest/payments.module.js';
@@ -50,6 +50,22 @@ class OrdersListener {
   @OnPaymentEvent()
   onAny(event: PaymentEvent) {
     this.all.push(event);
+  }
+}
+
+@Injectable()
+class BillingListener {
+  readonly activated: PaymentEvent[] = [];
+  readonly charges: PaymentEvent[] = [];
+
+  @OnPaymentEvent('subscription.activated')
+  onActivated(event: PaymentEvent) {
+    this.activated.push(event);
+  }
+
+  @OnPaymentEvent(['subscription.payment_succeeded', 'subscription.payment_failed'])
+  onCharge(event: PaymentEvent) {
+    this.charges.push(event);
   }
 }
 
@@ -207,5 +223,118 @@ describe('PaymentsModule', () => {
         customProviders: [{ name: 'wompi' } as any],
       }),
     ).toThrow(/duplicate/);
+  });
+
+  it('manages subscriptions through PaymentsService and dispatches subscription events', async () => {
+    const sub = {
+      id: 'sub_1',
+      status: 'active',
+      metadata: { reference: 'TENANT-1' },
+      items: {
+        data: [
+          {
+            quantity: 1,
+            price: {
+              id: 'price_1',
+              unit_amount: 1000,
+              currency: 'usd',
+              recurring: { interval: 'month', interval_count: 1 },
+            },
+          },
+        ],
+      },
+    };
+    const mock = mockFetch([
+      {
+        method: 'POST',
+        url: 'https://api.stripe.com/v1/prices',
+        body: {
+          id: 'price_1',
+          unit_amount: 1000,
+          currency: 'usd',
+          recurring: { interval: 'month', interval_count: 1 },
+        },
+      },
+      {
+        method: 'GET',
+        url: 'https://api.stripe.com/v1/prices/price_1',
+        body: { id: 'price_1', unit_amount: 1000, currency: 'usd' },
+      },
+      {
+        method: 'POST',
+        url: 'https://api.stripe.com/v1/checkout/sessions',
+        body: { id: 'cs_1', url: 'https://checkout.stripe.com/cs_1' },
+      },
+      { method: 'GET', url: 'https://api.stripe.com/v1/subscriptions/search', body: { data: [sub] } },
+      { method: 'GET', url: 'https://api.stripe.com/v1/subscriptions/sub_1', body: sub },
+      { method: 'DELETE', url: 'https://api.stripe.com/v1/subscriptions/sub_1', body: { ...sub, status: 'canceled' } },
+      { method: 'POST', url: 'https://api.stripe.com/v1/subscriptions/sub_1', body: sub },
+    ]);
+    const secret = 'whsec_nest';
+    const ref = await Test.createTestingModule({
+      imports: [
+        PaymentsModule.forRoot({
+          providers: {
+            wompi: wompiConfig,
+            stripe: { secretKey: 'sk_test', webhookSecret: secret, http: { fetch: mock.fetch } },
+          },
+          defaultProvider: 'stripe',
+        }),
+      ],
+      providers: [BillingListener],
+    }).compile();
+    app = ref.createNestApplication({ rawBody: true, logger: false });
+    await app.init();
+    const payments = ref.get(PaymentsService);
+    const listener = ref.get(BillingListener);
+
+    const plan = await payments.createPlan({ name: 'Pro', amount: 1000, currency: 'USD', interval: 'month' });
+    expect(plan.id).toBe('price_1');
+    expect(await payments.getPlan('stripe', 'price_1')).toMatchObject({ amount: 1000 });
+    expect(
+      await payments.createSubscription({ reference: 'TENANT-1', plan: 'price_1', successUrl: 'https://app.test' }),
+    ).toMatchObject({ url: 'https://checkout.stripe.com/cs_1' });
+    expect(await payments.findSubscriptionByReference('stripe', 'TENANT-1')).toMatchObject({ id: 'sub_1' });
+    expect(await payments.getSubscription('stripe', 'sub_1')).toMatchObject({ status: 'active' });
+    expect(await payments.cancelSubscription('stripe', { subscriptionId: 'sub_1' })).toMatchObject({
+      status: 'canceled',
+    });
+    expect(await payments.pauseSubscription('stripe', 'sub_1')).toMatchObject({ id: 'sub_1' });
+    expect(await payments.resumeSubscription('stripe', 'sub_1')).toMatchObject({ id: 'sub_1' });
+
+    await expect(payments.getSubscription('wompi', 'x')).rejects.toBeInstanceOf(UnsupportedOperationError);
+    await expect(
+      payments.createPlan({ name: 'x', amount: 1, currency: 'COP', interval: 'month' }, 'wompi'),
+    ).rejects.toThrow('wompi does not support subscriptions');
+
+    const post = (event: unknown) => {
+      const payload = JSON.stringify(event);
+      const t = Math.floor(Date.now() / 1000);
+      const v1 = createHmac('sha256', secret).update(`${t}.${payload}`).digest('hex');
+      return request(app!.getHttpServer())
+        .post('/payments/webhooks/stripe')
+        .set('Content-Type', 'application/json')
+        .set('Stripe-Signature', `t=${t},v1=${v1}`)
+        .send(payload);
+    };
+    const created = await post({ id: 'evt_1', type: 'customer.subscription.created', data: { object: sub } });
+    expect(created.body).toEqual({ received: true, id: 'evt_1', type: 'subscription.activated' });
+    await post({
+      id: 'evt_2',
+      type: 'invoice.paid',
+      data: {
+        object: {
+          id: 'in_1',
+          amount_paid: 1000,
+          currency: 'usd',
+          parent: { subscription_details: { subscription: 'sub_1', metadata: { reference: 'TENANT-1' } } },
+        },
+      },
+    }).expect(200);
+
+    expect(listener.activated).toHaveLength(1);
+    expect(listener.activated[0]).toMatchObject({ reference: 'TENANT-1', subscription: { planId: 'price_1' } });
+    expect(listener.charges).toHaveLength(1);
+    expect(listener.charges[0]).toMatchObject({ type: 'subscription.payment_succeeded', amount: 1000 });
   });
 });

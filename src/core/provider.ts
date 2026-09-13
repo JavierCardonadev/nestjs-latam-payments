@@ -1,11 +1,17 @@
 import type {
+  CancelSubscriptionRequest,
   CheckoutRequest,
   CheckoutSession,
   Payment,
   PaymentEvent,
+  Plan,
+  PlanRequest,
   ProviderCapabilities,
   Refund,
   RefundRequest,
+  Subscription,
+  SubscriptionRequest,
+  SubscriptionSession,
   WebhookRequest,
 } from './types.js';
 
@@ -35,4 +41,23 @@ export interface PaymentProvider {
    * MUST throw `WebhookVerificationError` when authenticity can't be proven.
    */
   parseWebhook(request: WebhookRequest): Promise<PaymentEvent>;
+
+  // Recurring billing. Implement all of them and set `capabilities.subscriptions`.
+
+  createPlan?(request: PlanRequest): Promise<Plan>;
+
+  getPlan?(planId: string): Promise<Plan>;
+
+  /** Starts a subscription and returns the URL where the customer authorizes it. */
+  createSubscription?(request: SubscriptionRequest): Promise<SubscriptionSession>;
+
+  getSubscription?(subscriptionId: string): Promise<Subscription>;
+
+  findSubscriptionByReference?(reference: string): Promise<Subscription | null>;
+
+  cancelSubscription?(request: CancelSubscriptionRequest): Promise<Subscription>;
+
+  pauseSubscription?(subscriptionId: string): Promise<Subscription>;
+
+  resumeSubscription?(subscriptionId: string): Promise<Subscription>;
 }
