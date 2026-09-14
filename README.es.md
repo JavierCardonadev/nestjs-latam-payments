@@ -304,7 +304,7 @@ Hay un ejemplo ejecutable en [examples/nest-app](examples/nest-app).
 
 ## ¿Necesitas ayuda integrando pagos en Latinoamérica?
 
-Soy Javier Cardona, desarrollador full-stack en Colombia y autor de este módulo. Ayudo a empresas a lanzar y corregir sus flujos de pago: elección de pasarela, checkout, webhooks y conciliación, suscripciones, operación multi-país y migraciones entre pasarelas.
+Soy Javier Cardona, desarrollador full-stack en Colombia y autor de este módulo. Ayudo a empresas a lanzar y corregir sus flujos de pago: elección de pasarela, checkout, webhooks y conciliación, suscripciones, operación multi-país y migraciones entre pasarelas. Mira también [nestjs-einvoicing](https://github.com/JavierCardonadev/nestjs-einvoicing), [nestjs-whatsapp](https://github.com/JavierCardonadev/nestjs-whatsapp), [nestjs-intl-validators](https://github.com/JavierCardonadev/nestjs-intl-validators) y [nestjs-shipping](https://github.com/JavierCardonadev/nestjs-shipping).
 
 👉 **[javiercardona.dev](https://javiercardona.dev)** — o abre un [issue de ayuda con integración](https://github.com/JavierCardonadev/nestjs-latam-payments/issues/new?template=integration-help.yml).
 
